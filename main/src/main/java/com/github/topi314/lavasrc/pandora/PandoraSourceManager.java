@@ -213,6 +213,9 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
 
     private AudioTrack mapTrack(JsonBrowser track, JsonBrowser annotations) {
         var title = track.get("name").text();
+        if (title == null || title.isEmpty()) {
+            return null;
+        }
         var author = track.get("artistName").text();
         if (author == null || author.isEmpty()) author = "unknown";
         var duration = track.get("duration").asLong(0) * 1000;
@@ -239,22 +242,26 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
         return new PandoraAudioTrack(info, albumName, albumUrl != null ? BASE_URL + albumUrl : null, artistUrl != null ? BASE_URL + artistUrl : null, artistArtworkUrl, null, false, this);
     }
 
+    private String buildAnnotateRequest(List<String> pandoraIds) {
+        StringBuilder ids = new StringBuilder("{\"pandoraIds\":[");
+        for (int i = 0; i < pandoraIds.size(); i++) {
+            if (i > 0) ids.append(',');
+            ids.append('"').append(escape(pandoraIds.get(i))).append('"');
+        }
+        ids.append("]}");
+        return ids.toString();
+    }
+
     private AudioItem getRecommendations(String trackId) throws IOException {
         String detailsBody = "{\"pandoraId\":\"" + escape(trackId) + "\"}";
         var details = postJson(ENDPOINT_DETAILS, detailsBody);
         var similar = details.get("trackDetails").get("similarTracks");
         if (similar.isNull() || similar.values().isEmpty()) return AudioReference.NO_TRACK;
-        StringBuilder ids = new StringBuilder();
-        ids.append("{");
-        ids.append("\"pandoraIds\":[");
-        boolean first = true;
+        List<String> idList = new ArrayList<>();
         for (var v : similar.values()) {
-            if (!first) ids.append(',');
-            ids.append('"').append(escape(v.text())).append('"');
-            first = false;
+            idList.add(v.text());
         }
-        ids.append("]}");
-        var annotations = postJson(ENDPOINT_ANNOTATE, ids.toString());
+        var annotations = postJson(ENDPOINT_ANNOTATE, buildAnnotateRequest(idList));
         List<AudioTrack> tracks = new ArrayList<>();
         for (var v : similar.values()) {
             var item = annotations.get(v.text());
@@ -308,7 +315,7 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
         reqObj.put("pandoraId", playlistId);
         reqObj.put("playlistVersion", 0);
         reqObj.put("offset", 0);
-        reqObj.put("limit", 100);
+        reqObj.put("limit", 5000);
         reqObj.put("annotationLimit", 100);
         reqObj.put("allowedTypes", JsonBrowser.parse("[\"TR\"]"));
         reqObj.put("bypassPrivacyRules", true);
@@ -317,11 +324,45 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
         var json = postJson(ENDPOINT_PLAYLIST_TRACKS, request.format());
         var annotations = json.get("annotations");
         var tracksNode = json.get("tracks");
+
+        Map<String, JsonBrowser> merged = new HashMap<>();
+        for (var v : annotations.values()) {
+            var id = v.get("pandoraId").text();
+            if (id != null && !id.isEmpty()) {
+                merged.put(id, v);
+            }
+        }
+
+        List<String> allIds = new ArrayList<>();
+        for (var t : tracksNode.values()) {
+            var id = t.get("pandoraId").text();
+            if (id != null && !id.isEmpty()) {
+                allIds.add(id);
+            }
+        }
+
+        List<String> missing = new ArrayList<>();
+        for (var id : allIds) {
+            if (!merged.containsKey(id)) {
+                missing.add(id);
+            }
+        }
+
+        if (!missing.isEmpty()) {
+            var extra = postJson(ENDPOINT_ANNOTATE, buildAnnotateRequest(missing));
+            for (var id : missing) {
+                var node = extra.get(id);
+                if (!node.isNull()) {
+                    merged.put(id, node);
+                }
+            }
+        }
+
         List<AudioTrack> tracks = new ArrayList<>();
         for (var t : tracksNode.values()) {
             var id = t.get("pandoraId").text();
-            var ann = annotations.get(id);
-            if (ann.isNull()) continue;
+            var ann = merged.get(id);
+            if (ann == null) continue;
             var at = mapTrack(ann, annotations);
             if (at != null) tracks.add(at);
         }
@@ -427,6 +468,7 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
     }
 
     private AudioSearchResult getAutocomplete(String query, java.util.Set<AudioSearchResult.Type> types) throws IOException {
+        final int limit = this.searchLimit;
         if (types.isEmpty()) {
             types = java.util.Set.of(AudioSearchResult.Type.TRACK);
         }
@@ -502,8 +544,8 @@ public class PandoraSourceManager extends MirroringAudioSourceManager implements
             }
         }
 
-        if (tracks.size() > this.searchLimit) {
-            tracks = new ArrayList<>(tracks.subList(0, this.searchLimit));
+        if (tracks.size() > limit) {
+            tracks = new ArrayList<>(tracks.subList(0, limit));
         }
         return new BasicAudioSearchResult(tracks, albums, artists, playlists, new ArrayList<>());
     }
